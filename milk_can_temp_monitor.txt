@@ -1,0 +1,153 @@
+/*
+  SIH Project: Milk Chilling Can - Temperature Monitoring System
+  Hardware: ESP8266 (NodeMCU) + DS18B20 (waterproof) + 16x2 I2C LCD + Li-ion battery
+
+  FEATURES:
+  - Reads milk temperature via DS18B20
+  - Displays live temp + status (SAFE / UNSAFE) on LCD
+  - Hosts its own WiFi Access Point + web page showing live temperature
+    (works WITHOUT internet - important for rural areas with no connectivity)
+  - Safe range configurable: 4-8 degC (per problem statement)
+
+  WIRING:
+  DS18B20:
+    VCC  -> 3.3V (NodeMCU)
+    GND  -> GND
+    DATA -> D4 (GPIO2)   [use a 4.7k ohm pull-up resistor between DATA and VCC]
+
+  I2C LCD (16x2, PCF8574 backpack):
+    VCC -> 3.3V (or 5V if module supports it)
+    GND -> GND
+    SDA -> D2 (GPIO4)
+    SCL -> D1 (GPIO5)
+
+  Power:
+    3.7V Li-ion cell -> TP4056 charging module -> onboard regulator of NodeMCU (VIN)
+    (NodeMCU has onboard 3.3V regulator; for battery-only use, feed 3.7-5V to VIN pin)
+
+  LIBRARIES NEEDED (install via Arduino Library Manager):
+    - OneWire            (by Paul Stoffregen)
+    - DallasTemperature  (by Miles Burton)
+    - LiquidCrystal_I2C  (by Frank de Brabander / John Rickman - any ESP8266-compatible fork)
+    - ESP8266WiFi        (bundled with ESP8266 board package)
+    - ESP8266WebServer   (bundled with ESP8266 board package)
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---------- CONFIG ----------
+#define ONE_WIRE_BUS D4        // DS18B20 data pin
+#define SAFE_TEMP_LOW  4.0     // degC - lower safe bound
+#define SAFE_TEMP_HIGH 8.0     // degC - upper safe bound
+#define READ_INTERVAL  5000    // ms between readings
+
+const char* AP_SSID = "MilkCan_Monitor";   // WiFi network the ESP8266 creates
+const char* AP_PASSWORD = "milkcan123";    // must be 8+ characters
+
+// ---------- OBJECTS ----------
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+LiquidCrystal_I2C lcd(0x27, 16, 2);        // change 0x27 to 0x3F if LCD doesn't respond
+ESP8266WebServer server(80);
+
+float currentTemp = 0.0;
+String status = "INITIALIZING";
+unsigned long lastRead = 0;
+
+// ---------- WEB PAGE ----------
+void handleRoot() {
+  String statusColor = (status == "SAFE") ? "green" : "red";
+
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='5'>";  // auto-refresh every 5s
+  html += "<title>Milk Can Monitor</title>";
+  html += "<style>body{font-family:Arial;text-align:center;margin-top:50px;background:#f4f4f4;}";
+  html += "h1{color:#333;} .temp{font-size:60px;font-weight:bold;color:" + statusColor + ";}";
+  html += ".status{font-size:28px;color:" + statusColor + ";font-weight:bold;}</style>";
+  html += "</head><body>";
+  html += "<h1>Milk Can Temperature Monitor</h1>";
+  html += "<div class='temp'>" + String(currentTemp, 1) + " &deg;C</div>";
+  html += "<div class='status'>" + status + "</div>";
+  html += "<p>Safe range: " + String(SAFE_TEMP_LOW, 1) + " - " + String(SAFE_TEMP_HIGH, 1) + " &deg;C</p>";
+  html += "<p style='color:gray;font-size:12px;'>Auto-refreshing every 5 seconds</p>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// simple JSON endpoint, useful if you later want to log data elsewhere
+void handleData() {
+  String json = "{\"temperature\":" + String(currentTemp, 2) + ",\"status\":\"" + status + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // LCD init
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Milk Can Monitor");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+
+  // Temp sensor init
+  sensors.begin();
+
+  // Start ESP8266 as its own WiFi Access Point (no internet/router needed)
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.print("Access Point IP: ");
+  Serial.println(apIP);  // typically 192.168.4.1
+
+  // Web server routes
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+
+  delay(1500);
+  lcd.clear();
+}
+
+void loop() {
+  server.handleClient();  // must be called continuously to serve web requests
+
+  if (millis() - lastRead >= READ_INTERVAL) {
+    lastRead = millis();
+
+    sensors.requestTemperatures();
+    currentTemp = sensors.getTempCByIndex(0);
+
+    if (currentTemp == DEVICE_DISCONNECTED_C) {
+      status = "SENSOR ERROR";
+    } else if (currentTemp >= SAFE_TEMP_LOW && currentTemp <= SAFE_TEMP_HIGH) {
+      status = "SAFE";
+    } else {
+      status = "UNSAFE";
+    }
+
+    // Update LCD
+    lcd.setCursor(0, 0);
+    lcd.print("Temp: ");
+    lcd.print(currentTemp, 1);
+    lcd.print((char)223);  // degree symbol
+    lcd.print("C   ");     // trailing spaces to clear old digits
+
+    lcd.setCursor(0, 1);
+    lcd.print("Status: ");
+    lcd.print(status);
+    lcd.print("   ");
+
+    Serial.print("Temp: ");
+    Serial.print(currentTemp);
+    Serial.print(" C | Status: ");
+    Serial.println(status);
+  }
+}
